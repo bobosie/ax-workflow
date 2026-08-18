@@ -1,8 +1,10 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "ax-workflow",
-  "description": "AX 工作流 skill 組（本地 marketplace，組織導入 dogfood）。",
-  "owner": { "name": "bobo" },
+  "description": "AX 工作流 skill 組：查經驗→寫規格→任務引擎→錄影 QA→實證→收割教訓。",
+  "owner": {
+    "name": "bobo"
+  },
   "plugins": [
     {
       "name": "ax",

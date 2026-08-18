@@ -31,7 +31,7 @@ plugin `ax` — 8 個指令（收→recap、收不乾淨→followup）：
 
 ## 安裝
 ```bash
-claude plugin marketplace add <你 clone 這個 repo 的路徑>   # 例：~/.ax-marketplace
+claude plugin marketplace add bobosie/ax-workflow   # 直接吃 GitHub，不必先 clone
 claude plugin install ax@ax-workflow --scope user
 ```
 安裝後**下一個 session** 生效（skill 於 session start 載入）。
