@@ -32,7 +32,7 @@ def _age(kind="age"):
 
 
 def _slug(name):
-    """檔名安全化（帳號名可能含 / 等字元，如 superadmin-hN/YW9）。可逆：unquote 還原。"""
+    """檔名安全化（帳號名可能含 / 等字元，如 admin-a/b）。可逆：unquote 還原。"""
     return urllib.parse.quote(name, safe="")
 
 
