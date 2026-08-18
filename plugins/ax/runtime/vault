@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+"""ax-vault — 本機加密憑證庫（掛 AX recall [LOCAL-PRIVATE] 發現層）。
+
+設計不變量（見 ~/Downloads/AX-Vault-設計PLAN.html）：
+  1. 祕密值只存在 per-entry age 密文（secrets/<tenant>/<name>.age）與解密瞬間的記憶體。
+  2. 進 recall 的只有 index/<name>.md —— 白名單生成、零祕密值。
+  3. 金鑰保管 = identity/age.key mode 600（headless 可用；Keychain 在 ssh/launchd 取不到，見 P0 實測）。
+  4. 本檔不 import/呼叫 ingest、不對中央 server POST；~/.ax-vault 不在任何 sync glob。
+取值路徑（vault get）與發現路徑（recall 讀 index）職責正交。
+"""
+from __future__ import annotations
+import argparse, json, os, re, shutil, subprocess, sys, time, urllib.parse
+
+HOME = os.path.expanduser(os.environ.get("AX_VAULT_HOME", "~/.ax-vault"))
+IDENTITY = os.path.join(HOME, "identity", "age.key")
+RECIP_DIR = os.path.join(HOME, "recipients")
+SEC_DIR = os.path.join(HOME, "secrets")
+IDX_DIR = os.path.join(HOME, "index")
+
+# 白名單：可進 index 的 metadata 欄位（祕密值永遠不在此）
+META_FIELDS = ["tenant", "env", "service", "brand", "note"]
+# canary 縱深防禦用（第二層，主防線是 value 子字串比對）
+_PATS = re.compile(r"(password|passwd|secret|api[_-]?key|token|pwd|密碼|密鑰|取款密碼|登入密碼)\s*[:=]\s*\S+", re.I)
+
+
+def _age(kind="age"):
+    env = "AX_VAULT_AGE" if kind == "age" else "AX_VAULT_AGE_KEYGEN"
+    p = os.environ.get(env) or shutil.which(kind) or f"/opt/homebrew/bin/{kind}"
+    if not os.path.exists(p):
+        sys.exit(f"[vault] 找不到 {kind}（headless 記得用絕對路徑 / 設 {env}）")
+    return p
+
+
+def _slug(name):
+    """檔名安全化（帳號名可能含 / 等字元，如 superadmin-hN/YW9）。可逆：unquote 還原。"""
+    return urllib.parse.quote(name, safe="")
+
+
+def _recipients_for(tenant):
+    f = os.path.join(RECIP_DIR, f"{tenant}.txt")
+    if os.path.exists(f):
+        return f
+    f = os.path.join(RECIP_DIR, "personal.txt")
+    if not os.path.exists(f):
+        sys.exit("[vault] 無 recipients，先跑 `vault init`")
+    return f
+
+
+def _entry_path(name, tenant=None):
+    fn = f"{_slug(name)}.age"
+    if tenant:
+        p = os.path.join(SEC_DIR, tenant, fn)
+        return p if os.path.exists(p) else None
+    for t in sorted(os.listdir(SEC_DIR)) if os.path.isdir(SEC_DIR) else []:
+        p = os.path.join(SEC_DIR, t, fn)
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _decrypt(path):
+    out = subprocess.run([_age(), "-d", "-i", IDENTITY, path], capture_output=True)
+    if out.returncode != 0:
+        sys.exit(f"[vault] 解密失敗 {path}: {out.stderr.decode().strip()}")
+    return json.loads(out.stdout.decode())
+
+
+def _encrypt(entry, tenant):
+    d = os.path.join(SEC_DIR, tenant)
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, f"{_slug(entry['name'])}.age")
+    tmp = path + f".tmp.{os.getpid()}"
+    p = subprocess.run([_age(), "-R", _recipients_for(tenant), "-o", tmp],
+                       input=json.dumps(entry, ensure_ascii=False).encode(), capture_output=True)
+    if p.returncode != 0:
+        sys.exit(f"[vault] 加密失敗: {p.stderr.decode().strip()}")
+    os.replace(tmp, path)
+    return path
+
+
+def _index_text(entry):
+    """白名單生成器：只輸出 metadata + 欄位名，永不輸出祕密值。"""
+    name = entry["name"]
+    env = ",".join(entry.get("env", []) or [])
+    tenant = entry.get("tenant", "personal")
+    has = ", ".join(sorted((entry.get("secrets") or {}).keys()))
+    line2 = " | ".join(
+        f"{k}:{entry[k]}" for k in ("service", "brand") if entry.get(k)
+    )
+    lines = [
+        f"## {name}  [tenant:{tenant} env:{env}]",
+        (entry.get("note") or "") + (f"  | {line2}" if line2 else ""),
+        f"持有: {has}",
+        f"取值: vault get {name} <field>",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _write_index(entry):
+    os.makedirs(IDX_DIR, exist_ok=True)
+    path = os.path.join(IDX_DIR, f"{_slug(entry['name'])}.md")
+    tmp = path + f".tmp.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(_index_text(entry))
+    os.replace(tmp, path)
+
+
+# ---------------- commands ----------------
+def cmd_init(a):
+    os.makedirs(os.path.join(HOME, "identity"), exist_ok=True)
+    os.makedirs(RECIP_DIR, exist_ok=True)
+    os.makedirs(SEC_DIR, exist_ok=True)
+    os.makedirs(IDX_DIR, exist_ok=True)
+    os.chmod(os.path.join(HOME, "identity"), 0o700)
+    if os.path.exists(IDENTITY):
+        print(f"[vault] identity 已存在，略過生成")
+    else:
+        p = subprocess.run([_age("age-keygen"), "-o", IDENTITY], capture_output=True)
+        if p.returncode != 0:
+            sys.exit(f"[vault] keygen 失敗: {p.stderr.decode()}")
+        os.chmod(IDENTITY, 0o600)
+        # 抽公鑰 → personal recipients
+        pub = ""
+        for ln in (p.stderr.decode() + p.stdout.decode()).splitlines():
+            m = re.search(r"(age1[0-9a-z]+)", ln)
+            if m:
+                pub = m.group(1)
+        if not pub:
+            with open(IDENTITY) as f:
+                for ln in f:
+                    if ln.startswith("# public key:"):
+                        pub = ln.split(":")[-1].strip()
+        with open(os.path.join(RECIP_DIR, "personal.txt"), "w") as f:
+            f.write(pub + "\n")
+        print(f"[vault] 初始化完成。identity=600，personal 公鑰={pub}")
+    _gitignore()
+
+
+def _gitignore():
+    gi = os.path.join(HOME, ".gitignore")
+    if not os.path.exists(gi):
+        with open(gi, "w") as f:
+            # identity 私鑰永不進 git；secrets 是密文可 git；index 零祕密可 git
+            f.write("identity/\n*.tmp.*\n")
+
+
+def cmd_add(a):
+    secrets = {}
+    for kv in a.secret or []:
+        k, _, v = kv.partition("=")
+        secrets[k.strip()] = v
+    if a.secret_stdin:
+        for ln in sys.stdin.read().splitlines():
+            k, _, v = ln.partition("=")
+            if k.strip():
+                secrets[k.strip()] = v
+    entry = {
+        "name": a.name, "tenant": a.tenant, "env": a.env.split(",") if a.env else [],
+        "service": a.service or "", "brand": a.brand or "", "note": a.note or "",
+        "secrets": secrets, "updated_at": int(a.now or 0),
+    }
+    # 若已存在，合併（補欄位不覆蓋既有祕密除非同名）
+    existing = _entry_path(a.name, a.tenant)
+    if existing:
+        old = _decrypt(existing)
+        merged = dict(old.get("secrets") or {}); merged.update(secrets)
+        entry["secrets"] = merged
+        for k in META_FIELDS:
+            if not entry.get(k) and old.get(k):
+                entry[k] = old[k]
+    _encrypt(entry, a.tenant)
+    _write_index(entry)
+    print(f"[vault] 已寫入 {a.name}（tenant={a.tenant}，欄位={list(entry['secrets'])}）")
+
+
+def cmd_get(a):
+    p = _entry_path(a.name, a.tenant)
+    if not p:
+        sys.exit(f"[vault] 查無 {a.name}")
+    entry = _decrypt(p)
+    if not a.field:
+        meta = {k: entry.get(k) for k in ["name"] + META_FIELDS}
+        meta["has"] = sorted((entry.get("secrets") or {}).keys())
+        print(json.dumps(meta, ensure_ascii=False))
+        return
+    val = (entry.get("secrets") or {}).get(a.field)
+    if val is None:
+        sys.exit(f"[vault] {a.name} 無欄位 {a.field}")
+    if sys.stdout.isatty():
+        sys.stderr.write("[vault] 提醒：值輸出到終端；agent 請以 $(vault get ...) 收進變數，勿 echo 進對話\n")
+    sys.stdout.write(val + ("\n" if sys.stdout.isatty() else ""))
+
+
+def cmd_ls(a):
+    if not os.path.isdir(IDX_DIR):
+        return
+    for f in sorted(os.listdir(IDX_DIR)):
+        if f.endswith(".md"):
+            print(urllib.parse.unquote(f[:-3]))
+
+
+def _all_entries():
+    for root, _, files in os.walk(SEC_DIR):
+        for fn in files:
+            if fn.endswith(".age"):
+                yield os.path.join(root, fn)
+
+
+def cmd_reindex(a):
+    n = 0
+    for p in _all_entries():
+        _write_index(_decrypt(p))
+        n += 1
+    print(f"[vault] reindex 完成，{n} 筆")
+
+
+def cmd_canary(a):
+    """獨立複驗（與生成器不同程式）：重新解密取祕密值 → 確認 index 一律不含。"""
+    bad = []; warn = []
+    for p in _all_entries():
+        entry = _decrypt(p)
+        idx = os.path.join(IDX_DIR, f"{_slug(entry['name'])}.md")
+        if not os.path.exists(idx):
+            bad.append(f"{entry['name']}: 缺 index"); continue
+        text = open(idx, encoding="utf-8").read()
+        # index 生成器白名單只輸出這些 metadata；值若出現在 index，只可能恰等於某段 metadata
+        meta = " ".join([entry.get("name", ""), entry.get("tenant", ""),
+                         " ".join(entry.get("env", []) or []), entry.get("note", "") or "",
+                         " ".join((entry.get("secrets") or {}).keys())])
+        for k, v in (entry.get("secrets") or {}).items():
+            # 子字串比對主防線；<4 字元的值無法與樣板區分，略過（真憑證恆 >=6），靠 regex 兜底
+            if v and len(str(v)) >= 4 and str(v) in text:
+                if str(v) in meta:   # 值恰為 metadata 子字串＝弱/可猜密碼，非生成器洩漏
+                    warn.append(f"{entry['name']}: [{k}] 值等於 metadata（弱密碼，建議輪換）")
+                else:                # 生成器真的把值寫進 index＝整合性破口
+                    bad.append(f"{entry['name']}: index 含祕密值 [{k}]（非 metadata）")
+        # regex 命中若全落在 metadata 行也放行（has: 欄位名含 password/token 字樣屬正常）
+        for m in _PATS.finditer(text):
+            if m.group(0) not in meta:
+                bad.append(f"{entry['name']}: index 命中機敏 regex 且非 metadata")
+                break
+    if warn:
+        print("[vault] CANARY 警告（弱密碼＝名稱/路徑，非洩漏，宜輪換）：\n  " + "\n  ".join(warn), file=sys.stderr)
+    if bad:
+        print("[vault] CANARY 紅燈（真洩漏）：\n  " + "\n  ".join(bad), file=sys.stderr)
+        sys.exit(2)
+    print(f"[vault] CANARY 綠燈：所有 index 零祕密洩漏（{len(warn)} 個弱密碼警告）")
+
+
+def cmd_recipients(a):
+    """team 多公鑰管理（admin only）。add/rm 後需 `vault reencrypt <tenant>` 才對既有密文生效。"""
+    os.makedirs(RECIP_DIR, exist_ok=True)
+    f = os.path.join(RECIP_DIR, f"{a.tenant}.txt")
+    lines = [l.strip() for l in open(f)] if os.path.exists(f) else []
+    lines = [l for l in lines if l]
+    if a.action == "ls":
+        for l in lines:
+            print(l)
+        return
+    if not a.pubkey:
+        sys.exit("[vault] add/rm 需要 pubkey")
+    if a.action == "add" and a.pubkey not in lines:
+        lines.append(a.pubkey)
+    elif a.action == "rm":
+        lines = [l for l in lines if l != a.pubkey]
+    with open(f, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    print(f"[vault] {a.tenant} recipients={len(lines)} 把公鑰（記得 `vault reencrypt {a.tenant}` 讓既有密文生效）")
+
+
+def cmd_reencrypt(a):
+    """對現行 recipients 重加密（撤銷成員後用；admin 須在 recipients 內才能解密重寫）。"""
+    n = 0
+    for p in _all_entries():
+        tenant = os.path.basename(os.path.dirname(p))
+        if a.tenant and tenant != a.tenant:
+            continue
+        _encrypt(_decrypt(p), tenant)
+        n += 1
+    print(f"[vault] reencrypt {n} 筆（tenant={a.tenant or 'all'}）")
+
+
+def cmd_otp(a):
+    p = _entry_path(a.name, a.tenant)
+    if not p:
+        sys.exit(f"[vault] 查無 {a.name}")
+    sec = (_decrypt(p).get("secrets") or {}).get("totp_secret")
+    if not sec:
+        sys.exit(f"[vault] {a.name} 無 totp_secret")
+    print(_totp_native(sec))
+
+
+def _totp_native(secret, digits=6, period=30):
+    """RFC 6238 TOTP，純 stdlib——不依賴 oathtool，任何 Mac/Linux 免裝額外工具即可算 OTP。"""
+    import hmac, hashlib, base64, struct, time
+    s = secret.strip().replace(" ", "").upper()
+    s += "=" * ((8 - len(s) % 8) % 8)
+    try:
+        key = base64.b32decode(s)
+    except Exception:
+        sys.exit("[vault] totp_secret 非合法 base32")
+    msg = struct.pack(">Q", int(time.time()) // period)
+    h = hmac.new(key, msg, hashlib.sha1).digest()
+    o = h[-1] & 0x0F
+    code = (struct.unpack(">I", h[o:o + 4])[0] & 0x7FFFFFFF) % (10 ** digits)
+    return str(code).zfill(digits)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="vault")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("init").set_defaults(fn=cmd_init)
+    a = sub.add_parser("add"); a.set_defaults(fn=cmd_add)
+    a.add_argument("name"); a.add_argument("--tenant", default="personal")
+    a.add_argument("--env", default=""); a.add_argument("--service", default="")
+    a.add_argument("--brand", default=""); a.add_argument("--note", default="")
+    a.add_argument("--secret", action="append"); a.add_argument("--secret-stdin", action="store_true")
+    a.add_argument("--now", default=0)
+    g = sub.add_parser("get"); g.set_defaults(fn=cmd_get)
+    g.add_argument("name"); g.add_argument("field", nargs="?"); g.add_argument("--tenant", default=None)
+    sub.add_parser("ls").set_defaults(fn=cmd_ls)
+    sub.add_parser("reindex").set_defaults(fn=cmd_reindex)
+    sub.add_parser("canary").set_defaults(fn=cmd_canary)
+    o = sub.add_parser("otp"); o.set_defaults(fn=cmd_otp)
+    o.add_argument("name"); o.add_argument("--tenant", default=None)
+    rc = sub.add_parser("recipients"); rc.set_defaults(fn=cmd_recipients)
+    rc.add_argument("action", choices=["add", "rm", "ls"]); rc.add_argument("tenant")
+    rc.add_argument("pubkey", nargs="?")
+    re_ = sub.add_parser("reencrypt"); re_.set_defaults(fn=cmd_reencrypt)
+    re_.add_argument("tenant", nargs="?", default=None)
+    args = ap.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
